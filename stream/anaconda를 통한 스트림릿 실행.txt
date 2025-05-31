@@ -1,3 +1,5 @@
 streamlit run C:\Users\USER\Desktop\stream\color.py
 activate color
 streamlit run c:/Users/USER/Desktop/stream/color.py
+streamlit run C:\Users\sking\Desktop\stream\DRT.py
+st.session_state["last_run_time"] = st._get_time().strftime("%Y-%m-%d %H:%M:%S")

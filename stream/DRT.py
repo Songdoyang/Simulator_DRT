@@ -1,155 +1,262 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-from PIL import Image
-import plotly.graph_objects as go
-from sklearn.linear_model import LinearRegression
-import colorsys
-# 파일 내장장
-final_data_path = "C:/Users/USER/Desktop/stream/final_data.csv"
-color_data_path = "C:/Users/USER/Desktop/stream/color_data.csv"
-image_file_path = "C:/Users/USER/Desktop/stream/DRT_benor.jpg" #일반 이미지 경로로
+import datetime
+import seaborn as sns
+import matplotlib.pyplot as plt
+import numpy as np
+import io, sys
+import koreanize_matplotlib
+from simulator import Simulation  # DRT 시뮬레이터
+from visualization_route import plot_route  # 시각화 함수
+from streamlit_folium import st_folium
 
-#창 크기 늘리기
 st.set_page_config(layout="wide")
-#데이터 불러오기기
+
+# 노선 옵션 및 파일 경로 설정
+route_options = {
+    '25번': {
+        'demand_file': "C:\\Users\\sking\\Desktop\\stream\\bus_25(10-16).xlsx",
+        'dropoff_file': "C:\\Users\\sking\\Desktop\\stream\\승하차정류장_ID.csv",
+        'coord_file': "C:\\Users\\sking\\Desktop\\stream\\정류장_좌표.xlsx"
+    },
+    '23번': {
+        'demand_file': "C:\\Users\\sking\\Desktop\\stream\\bus_23(10-16).xlsx",
+        'dropoff_file': "C:\\Users\\sking\\Desktop\\stream\\승하차정류장_ID.csv",
+        'coord_file': "C:\\Users\\sking\\Desktop\\stream\\정류장_좌표.xlsx"
+    }
+}
+
+시간대들 = ['10', '11', '12', '13', '14', '15', '16']
+승차컬럼 = [f"{h}(승차)" for h in 시간대들]
+하차컬럼 = [f"{h}(하차)" for h in 시간대들]
+
 @st.cache_data
-def load_data(file_path, encoding):
-    data = pd.read_csv(file_path, encoding=encoding)
-    return data
+def load_demand_data(path: str) -> pd.DataFrame:
+    return pd.read_excel(path)[['정류장_ID', '일'] + 시간대들]
 
-DRT_img = Image.open(image_file_path)
+@st.cache_data
+def load_dropoff_data(path: str) -> pd.DataFrame:
+    return pd.read_csv(path)
 
-def hsl_to_rgb(h, s, l):
-    return tuple(round(c * 255) for c in colorsys.hls_to_rgb(h / 360, l / 100, s / 100))
+@st.cache_data
+def load_coord_data(path: str) -> pd.DataFrame:
+    return pd.read_excel(path)
+
+def generate_prediction_local(df, target_date):
+    df['월'] = pd.to_datetime(df['일']).dt.month
+    train_df = df[df['월'].between(3, 10)]
+
+    stats = (
+        train_df
+        .groupby('정류장_ID')[시간대들]
+        .agg(['mean', 'std'])
+    )
+    stats.columns = [f'{col}_{stat}' for col, stat in stats.columns]
+    stats = stats.reset_index()
+
+    date_str = pd.to_datetime(target_date).strftime('%Y-%m-%d')
+    test_df = df[df['일'] == date_str].copy()
+    if test_df.empty:
+        st.warning(f"[경고] 일자 '{date_str}'에 해당하는 데이터가 없습니다.")
+        return pd.DataFrame()
+
+    np.random.seed(hash(target_date) % (2**32))
+
+    결과 = []
+    for _, row in test_df.iterrows():
+        정류장 = row['정류장_ID']
+        통계행 = stats[stats['정류장_ID'] == 정류장]
+        if 통계행.empty:
+            continue
+        예측 = {'정류장_ID': 정류장, '일': date_str}
+        for 시간 in 시간대들:
+            λ = 통계행[f'{시간}_mean'].values[0]
+            λ = max(λ, 1e-6)
+            예측[f'{시간}(승차)'] = int(np.random.poisson(λ))
+        결과.append(예측)
+
+    return pd.DataFrame(결과)
+
+def plot_tradeoff_curve():
+    x = np.linspace(0, 1, 100)
+    cost_from_distance = 10000 + 8000 * np.exp(4 * (x - 1))
+    cost_from_wait = 10000 + 8000 * np.exp(-4 * x)
+    mid_index = np.argmin(np.abs(cost_from_distance - cost_from_wait))
+    opt_x = x[mid_index]
+    opt_cost = cost_from_distance[mid_index]
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(x, cost_from_distance, label="거리 vs 비용", color='blue')
+    ax.plot(x, cost_from_wait, label="대기시간 vs 비용", color='orange')
+    ax.plot(opt_x, opt_cost, 'ro', label="최적 Trade-off 점")
+
+    ax.set_xlabel("비중 (거리: 0 → 대기시간: 1)", fontsize=12)
+    ax.set_ylabel("예상 비용 (원)", fontsize=12)
+    ax.set_title("거리 기반과 대기시간 기반 비용 곡선의 교차", fontsize=14)
+    ax.grid(True)
+    ax.legend()
+    st.pyplot(fig)
+
+def run_simulation_for_route(route_key):
+    if 'simulations' not in st.session_state:
+        st.session_state.simulations = {}
+    if route_key not in st.session_state.simulations:
+        sim = Simulation()
+        st.session_state.simulations[route_key] = sim.run()
+    return st.session_state.simulations[route_key]
+
+import streamlit as st
 
 def main():
-    final_data = load_data(final_data_path, encoding='cp949')
-    color_data = load_data(color_data_path, encoding='cp949')
+    if "menu_shown" not in st.session_state:
+        st.session_state.menu_shown = False
 
-    menu = st.sidebar.selectbox("Menu", ["메인", "기존버스", "분포및히트맵","최종결과"])
+    if not st.session_state.menu_shown:
+        st.title("🚍 DRT 시뮬레이션 및 시각화")
 
-    if menu == "메인":
-        col1, col2 = st.columns([4, 3])
+        col1, col2 = st.columns([1, 1])
 
         with col1:
-            st.title('DRT 시뮬레이터')
-            st.title('시흥시 도입방안')
+            st.markdown(
+                """
+                <div style="text-align: left;">
+                    <h2>팀원 소개</h2>
+                    <hr style="border:1px solid #999999;">
+                    <div style="
+                        border: 2px solid #555555;
+                        border-radius: 8px;
+                        padding: 10px;
+                        background-color: #f0f0f0;
+                        max-width: 250px;
+                    ">
+                        <ul style="margin:0; padding-left: 20px;">
+                            <li>한승훈</li>
+                            <li>한현성</li>
+                            <li>송도훈</li>
+                            <li>최승환</li>
+                            <li>이현규</li>
+                        </ul>
+                    </div>
+                    <hr>
+                    <p>아래 버튼을 클릭하면 시뮬레이션 및 시각화 기능으로 이동합니다.</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-        with col2:  
-            st.image(DRT_img, use_column_width=True)
-            st.title('팀 구성')
-            st.subheader('한승훈, 송도훈, 한현성, 이현규, 최승환')
+            # 버튼 따로 스트림릿으로 빼서 작동하게
+            if st.button("시작하기 ▶"):
+                st.session_state.menu_shown = True
+                return
 
-    elif menu == "대시보드":
-        st.title("대시보드")
-        st.subheader("전체 데이터 프레임")
-        st.write(final_data)
+        with col2:
+            st.markdown('<div style="text-align: right;">', unsafe_allow_html=True)
+            st.image("C:/Users/sking/Desktop/stream/DRT_benor.jpg", width=550)
+            st.markdown('</div>', unsafe_allow_html=True)
 
-        st.markdown("---")
+        return
 
-        st.subheader("산점도:")
-        numeric_columns = final_data.select_dtypes(include='number').columns.tolist()
-        x_column = st.selectbox("x축 변수 선택", options=numeric_columns)
-        y_column = st.selectbox("Y 축 변수 선택", options=['염색색차 DE'])
+    menu = st.sidebar.selectbox(
+        "Menu", 
+        ["📊 예측 및 히트맵 시각화", "▶ 시뮬레이션 실행", "📋 결과 확인", "🗺️ 노선 경로 시각화"]
+    )
 
-        if x_column and y_column:
-            fig = px.scatter(final_data, x=x_column, y=y_column, title=f"Scatter Plot of {y_column} vs {x_column}")
-            st.plotly_chart(fig)
+    if menu == "📊 예측 및 히트맵 시각화":
+        st.title("🚍 DRT 수요 예측 및 하차 히트맵 시각화")
+        selected_route = st.selectbox("버스 노선을 선택하세요", list(route_options.keys()))
+        file_paths = route_options[selected_route]
+        target_date = st.date_input("예측할 날짜를 선택하세요", value=datetime.date(2024, 3, 4))
 
-        st.markdown("---")    
-            
+        df_demand = load_demand_data(file_paths['demand_file'])
+        df_dropoff = load_dropoff_data(file_paths['dropoff_file'])
 
-        st.title("추가 데이터 분석")
+        predicted = generate_prediction_local(df_demand, target_date)
 
-        numeric_columns = final_data.select_dtypes(include=['float64', 'int64']).columns.tolist()
-        final_data_numeric = final_data[numeric_columns]
+        tab1, tab2, tab3 = st.tabs(["수요 분포 추정값", "하차 히트맵", "거리 vs 대기시간 Trade-off"])
 
-        corr_matrix = final_data_numeric.corr()
+        with tab1:
+            st.subheader("📈 수요 분포 추정값")
+            if not predicted.empty:
+                st.dataframe(predicted)
+                sum_by_hour = predicted[승차컬럼].sum()
+                st.bar_chart(sum_by_hour)
+            else:
+                st.warning("선택한 날짜에 데이터가 없습니다.")
 
-        st.subheader("변수 간 상관관계 히트맵")
-        fig_corr = px.imshow(corr_matrix)
-        st.plotly_chart(fig_corr)
+        with tab2:
+            st.subheader("📍 하차 히트맵")
+            raw_df = df_dropoff[['정류장_ID'] + 하차컬럼].set_index('정류장_ID')
+            norm = df_dropoff.set_index('정류장_ID')['통과노선수']
+            heatmap_df = raw_df.div(norm, axis=0).fillna(0)
 
-        st.markdown("---")
+            fig, ax = plt.subplots(figsize=(10, max(4, len(heatmap_df)*0.25)))
+            sns.heatmap(heatmap_df, annot=True, fmt=".2f", cmap="YlOrRd", ax=ax)
+            st.pyplot(fig)
 
-        st.title("추가 데이터 분석")
+        with tab3:
+            st.subheader("🚍 거리 vs 대기시간 Trade-off 시각화")
+            plot_tradeoff_curve()
 
-        st.subheader("변수별 분포")
+    elif menu == "▶ 시뮬레이션 실행":
+        st.header("▶ 시뮬레이션 실행하기")
+        st.markdown("시뮬레이션 시작버튼을 눌러주세요.")
 
-        num_cols_per_row = 2
-        num_plots = len(numeric_columns)
-        num_rows = (num_plots - 1) // num_cols_per_row + 1
+        if st.button("시뮬레이션 시작"):
+            log_buffer = io.StringIO()
+            old_stdout = sys.stdout
+            sys.stdout = log_buffer
+            plt.close("all")
 
-        for i in range(num_rows):
-            cols_in_row = st.columns(num_cols_per_row)
-            for j in range(num_cols_per_row):
-                index = i * num_cols_per_row + j
-                if index < num_plots:
-                    col = numeric_columns[index]
-                    fig_hist = px.histogram(final_data, x=col, title=f"Histogram of {col}")
-                    cols_in_row[j].plotly_chart(fig_hist)
-    
-    elif menu == "모델링":
-        st.title("선형 회귀 모델")
+            sim = Simulation()
+            sim.run()
 
-        st.subheader("변수 선택:")
-        x_variables = st.multiselect("X 축 변수 선택:", options=final_data.select_dtypes(include=['float64', 'int64']).columns.tolist())
-        y_variable = '염색색차 DE'
+            sys.stdout = old_stdout
 
-        if st.button("모델링 시작"):
-            X = final_data[x_variables]
-            y = final_data[y_variable]
+            log_text = log_buffer.getvalue()
+            st.session_state["last_run_log"] = log_text
+            st.session_state["last_run_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            model = LinearRegression()
-            model.fit(X, y)
+            st.success("✅ 시뮬레이션이 완료되었습니다.  \n'결과 확인' 메뉴로 이동해주세요.")
 
-            y_pred = model.predict(X)
+    elif menu == "📋 결과 확인":
+        st.header("📊 시뮬레이션 결과 확인")
 
-            fig = px.scatter(final_data, x=x_variables, y=y_variable, title=f'{y_variable} vs. {", ".join(x_variables)}')
-            fig.add_scatter(x=final_data[x_variables[0]], y=y_pred, mode='lines', name='선형 회귀 예측')
-            st.plotly_chart(fig)
+        if "last_run_log" not in st.session_state:
+            st.warning("아직 시뮬레이션이 실행되지 않았습니다.  \n'시뮬레이션 실행' 메뉴에서 실행해주세요.")
+            return
 
-        st.markdown("---")
+        st.subheader("📝 시뮬레이션 로그")
+        st.code(st.session_state["last_run_log"])
 
-        st.title('염색 색상 변화 시각화')
+        fig_nums = plt.get_fignums()
+        if not fig_nums:
+            st.info("노선 경로를 확인하시려면 '노선 경로 시각화'로 이동해주세요.")
+        else:
+            for num in fig_nums:
+                fig = plt.figure(num)
+                st.subheader(f"📈 Figure {num}")
+                st.pyplot(fig)
+            plt.close("all")
 
-        dl_value = st.slider("염색색차 DL", min_value=0.0, max_value=color_data['염색색차 DL'].max(), value=0.0, step=0.1)
-        da_value = st.slider("염색색차 DA", min_value=color_data['염색색차 DA'].min(), max_value=color_data['염색색차 DA'].max(), value=0.0, step=0.1)
-        db_value = st.slider("염색색차 DB", min_value=color_data['염색색차 DB'].min(), max_value=color_data['염색색차 DB'].max(), value=0.0, step=0.1)
-        dc_value = st.slider("염색색차 DC", min_value=color_data['염색색차 DC'].min(), max_value=color_data['염색색차 DC'].max(), value=0.0, step=0.1)
-        dh_value = st.slider("염색색차 DH", min_value=color_data['염색색차 DH'].min(), max_value=color_data['염색색차 DH'].max(), value=0.0, step=0.1)
+    elif menu == "🗺️ 노선 경로 시각화":
+        st.title("🗺️ 노선 및 시간대별 경로 시각화")
 
-        def calculate_color(dl, da, db, dc, dh):
-            brightness = max(0, dl / color_data['염색색차 DL'].max() * 100)
+        selected_route = st.selectbox("노선을 선택하세요", list(route_options.keys()))
+        coord_df = load_coord_data(route_options[selected_route]['coord_file'])
 
-            r = int(max(0, min(255, 128 + da / color_data['염색색차 DA'].max() * 127 - db / color_data['염색색차 DB'].max() * 127)))
-            g = int(max(0, min(255, 128 - da / color_data['염색색차 DA'].max() * 127 + db / color_data['염색색차 DB'].max() * 127)))
-            y = int(max(0, min(255, 128 + db / color_data['염색색차 DB'].max() * 127 - da / color_data['염색색차 DA'].max() * 127)))
-            b = int(max(0, min(255, 128 - db / color_data['염색색차 DB'].max() * 127 + da / color_data['염색색차 DA'].max() * 127)))
+        # 시뮬레이션 결과 가져오기
+        total_route = run_simulation_for_route(selected_route)
+        selected_hour = st.selectbox("시간대를 선택하세요", options=sorted(total_route.keys()))
 
-            saturation = max(0, abs(dc / color_data['염색색차 DC'].max()))
+        df_selected = coord_df
+        plot_df = pd.DataFrame()
+        for station in total_route[selected_hour]: 
+            station_id = station.split('(')[0]
+            plot_df = pd.concat([plot_df, df_selected[df_selected['정류장_ID'] == station_id]], axis=0)
 
-            hue_shift = dh / color_data['염색색차 DH'].max() * 360
-
-            rgb_color = hsl_to_rgb(hue_shift, saturation * 100, brightness)
-
-            hex_color = f"#{rgb_color[0]:02x}{rgb_color[1]:02x}{rgb_color[2]:02x}"
-
-            return hex_color
-
-        def hsl_to_rgb(h, s, l):
-            return tuple(round(i * 255) for i in colorsys.hls_to_rgb(h / 360, l / 100, s / 100))
-
-        color = calculate_color(dl_value, da_value, db_value, dc_value, dh_value)
-
-        fig_color = go.Figure(data=go.Scatter(
-            x=[0], y=[0],
-            marker=dict(color=color, size=200),
-            mode='markers',
-            hoverinfo='skip'
-        ))
-        st.plotly_chart(fig_color)
+        m = plot_route(plot_df)
+        st.subheader("🗺️ 경로 지도")
+        st_folium(m, width=700, height=500)
 
 if __name__ == "__main__":
     main()
